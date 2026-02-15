@@ -71,6 +71,8 @@ jobs:
           move *.exe BuildOutput/Release/
           move *.dll BuildOutput/Release/
           move easyflash BuildOutput/Release
+          mkdir -p BuildOutput/Release/spec
+          cp -a Utils/spec/* BuildOutput/Release/spec/
 
       #- name: Copy loaders directory into release
       #  run: |
