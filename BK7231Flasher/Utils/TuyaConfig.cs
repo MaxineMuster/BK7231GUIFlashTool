@@ -6,266 +6,10 @@ using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
-using System.Threading.Tasks;
-using static BK7231Flasher.MiscUtils;
-
-// These static containers will be filled on demand.
-static Dictionary<string, MappingEntry>? s_keyMap;
-static List<(Regex regex, MappingEntry entry)>? s_regexList;
-static Dictionary<string, Dictionary<string, string>>? s_valueMaps;
-static bool s_mappingsInitialized = false;
-
-// JSON-driven mapping support
-// Add these using directives at file top if not present:
 using System.Text.Json;
 using System.Text.Json.Serialization;
-
-class MappingEntry
-{
-    public string? search { get; set; }
-    public string? role { get; set; }          // may be "VALUEONLY", null, or a real role name
-    public string? desc { get; set; }
-    public bool? nochan { get; set; }
-    public int? channel { get; set; }
-    public string? special { get; set; }
-    public string? conditional { get; set; }
-    public int? group { get; set; }
-}
-
-class SpecRoot
-{
-    public object? meta { get; set; }
-    public List<MappingEntry>? mappings { get; set; }
-    public Dictionary<string, Dictionary<string, string>>? valueMaps { get; set; }
-}
-
-
-// Call this once (lazy) before using mappings.
-static void EnsureMappingsLoaded()
-{
-    if (s_mappingsInitialized) return;
-    s_mappingsInitialized = true;
-
-    try
-    {
-        // Try to locate spec file next to application, then relative path "spec/tuya-spec.json"
-        string baseDir = AppContext.BaseDirectory ?? Directory.GetCurrentDirectory();
-        string[] candidates = new []
-        {
-            Path.Combine(baseDir, "spec", "tuya-spec.json"),
-            Path.Combine(baseDir, "tuya-spec.json"),
-            Path.Combine(Directory.GetCurrentDirectory(), "spec", "tuya-spec.json"),
-            Path.Combine(Directory.GetCurrentDirectory(), "tuya-spec.json")
-        };
-
-        string? specPath = candidates.FirstOrDefault(p => File.Exists(p));
-        if (specPath == null)
-        {
-            // Not fatal — leave maps empty (you can choose to log or throw instead)
-            FormMain.Singleton.addLog("TuyaConfig: spec/tuya-spec.json not found. JSON-driven mappings disabled." + Environment.NewLine, System.Drawing.Color.Orange);
-            s_keyMap = new Dictionary<string, MappingEntry>();
-            s_regexList = new List<(Regex, MappingEntry)>();
-            s_valueMaps = new Dictionary<string, Dictionary<string, string>>();
-            return;
-        }
-
-        var raw = File.ReadAllText(specPath, Encoding.UTF8);
-
-        // Use System.Text.Json options to skip comments (if present)
-        var jopts = new JsonDocumentOptions { CommentHandling = JsonCommentHandling.Skip };
-        SpecRoot? specRoot = null;
-
-        try
-        {
-            using (var doc = JsonDocument.Parse(raw, jopts))
-            {
-                var json = doc.RootElement.GetRawText();
-                specRoot = JsonSerializer.Deserialize<SpecRoot>(json, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
-            }
-        }
-        catch (Exception ex)
-        {
-            // If parsing with JsonDocument failed for any reason, try stripping comments and parse
-            try
-            {
-                string clean = StripJsonComments(raw);
-                specRoot = JsonSerializer.Deserialize<SpecRoot>(clean, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
-            }
-            catch
-            {
-                FormMain.Singleton.addLog("TuyaConfig: Failed to parse spec/tuya-spec.json: " + ex.Message + Environment.NewLine, System.Drawing.Color.Orange);
-                s_keyMap = new Dictionary<string, MappingEntry>();
-                s_regexList = new List<(Regex, MappingEntry)>();
-                s_valueMaps = new Dictionary<string, Dictionary<string, string>>();
-                return;
-            }
-        }
-
-        s_keyMap = new Dictionary<string, MappingEntry>(StringComparer.Ordinal);
-        s_regexList = new List<(Regex, MappingEntry)>();
-        s_valueMaps = specRoot?.valueMaps ?? new Dictionary<string, Dictionary<string, string>>();
-
-        if (specRoot?.mappings != null)
-        {
-            foreach (var m in specRoot.mappings)
-            {
-                if (m?.search == null) continue;
-                var s = m.search.Trim();
-
-                // If the JSON uses "/^...$/" form, treat it as regex
-                if (s.Length >= 2 && s[0] == '/' && s[s.Length - 1] == '/')
-                {
-                    var body = s.Substring(1, s.Length - 2);
-                    try
-                    {
-                        // Use compiled regex with CultureInvariant; keep capture groups for number extraction
-                        var rx = new Regex(body, RegexOptions.Compiled | RegexOptions.CultureInvariant);
-                        s_regexList.Add((rx, m));
-                    }
-                    catch (Exception ex)
-                    {
-                        FormMain.Singleton.addLog($"TuyaConfig: invalid regex in spec: {s} -> {ex.Message}" + Environment.NewLine, System.Drawing.Color.Orange);
-                    }
-                }
-                else
-                {
-                    // exact key
-                    if (!s_keyMap.ContainsKey(s)) s_keyMap[s] = m;
-                    else
-                    {
-                        // duplicate key in spec: prefer first, but log
-                        FormMain.Singleton.addLog($"TuyaConfig: duplicate mapping for key '{s}' in spec; first one kept." + Environment.NewLine, System.Drawing.Color.Orange);
-                    }
-                }
-            }
-        }
-    }
-    catch (Exception ex)
-    {
-        FormMain.Singleton.addLog("TuyaConfig: exception while loading spec: " + ex.Message + Environment.NewLine, System.Drawing.Color.Orange);
-        s_keyMap = new Dictionary<string, MappingEntry>();
-        s_regexList = new List<(Regex, MappingEntry)>();
-        s_valueMaps = new Dictionary<string, Dictionary<string, string>>();
-    }
-}
-
-// Minimal comment-stripping fallback (same idea as JS stripper)
-static string StripJsonComments(string input)
-{
-    var sb = new StringBuilder(input.Length);
-    bool inString = false;
-    char stringChar = '\0';
-    bool escape = false;
-    bool inLineComment = false;
-    bool inBlockComment = false;
-
-    for (int i = 0; i < input.Length; i++)
-    {
-        char ch = input[i];
-        char next = (i + 1 < input.Length) ? input[i + 1] : '\0';
-
-        if (inLineComment)
-        {
-            if (ch == '\n')
-            {
-                inLineComment = false;
-                sb.Append(ch);
-            }
-            continue;
-        }
-
-        if (inBlockComment)
-        {
-            if (ch == '*' && next == '/')
-            {
-                inBlockComment = false;
-                i++; // skip '/'
-            }
-            continue;
-        }
-
-        if (inString)
-        {
-            sb.Append(ch);
-            if (!escape && ch == stringChar) inString = false;
-            escape = (!escape && ch == '\\');
-            continue;
-        }
-
-        if (ch == '"' || ch == '\'')
-        {
-            inString = true;
-            stringChar = ch;
-            sb.Append(ch);
-            continue;
-        }
-
-        if (ch == '/' && next == '/')
-        {
-            inLineComment = true;
-            i++;
-            continue;
-        }
-
-        if (ch == '/' && next == '*')
-        {
-            inBlockComment = true;
-            i++;
-            continue;
-        }
-
-        sb.Append(ch);
-    }
-    return sb.ToString();
-}
-
-// Try to map mapping.role (string) to your PinRole enum. If role is "VALUEONLY" or null we don't set pin role.
-static bool TryApplyMappingToTemplate(MappingEntry m, string key, string value, OBKConfig? tg)
-{
-    // description replacement
-    string desc = (m.desc ?? "").Replace("{value}", value);
-
-    int? number = null;
-    // If regex mapping provided a {number} placeholder, we expect callers to compute number.
-    // For key-based entries with channel field set, use that.
-    if (m.channel.HasValue) number = m.channel.Value;
-
-    // If role is missing or explicitly VALUEONLY -> only return description
-    if (string.IsNullOrWhiteSpace(m.role) || string.Equals(m.role, "VALUEONLY", StringComparison.OrdinalIgnoreCase))
-    {
-        // nothing to set on tg
-        return false;
-    }
-
-    // Try parse role as PinRole enum first
-    if (Enum.TryParse<PinRole>(m.role, true, out var pr))
-    {
-        // use number (channel) if available, else default 0
-        var ch = number ?? 0;
-        // apply to template
-        tg?.setPinRole(value, pr);
-        tg?.setPinChannel(value, ch);
-        return true;
-    }
-
-    // Some roles in spec are pseudo-names that don't exactly match PinRole enum, add mapping if necessary:
-    switch (m.role)
-    {
-        case "BridgeFWD":
-            // map to relay (Rel) - choose channel from mapping or 0
-            tg?.setPinRole(value, PinRole.Rel);
-            tg?.setPinChannel(value, number ?? 0);
-            return true;
-        case "BridgeREV":
-            tg?.setPinRole(value, PinRole.Rel_n);
-            tg?.setPinChannel(value, number ?? 0);
-            return true;
-        // add more alias mappings here if your PinRole enum differs from spec strings
-        default:
-            FormMain.Singleton.addLog($"TuyaConfig: Unknown role '{m.role}' for key '{key}' in tuya-spec.json. Skipping setPinRole." + Environment.NewLine, System.Drawing.Color.Orange);
-            return false;
-    }
-}
+using System.Threading.Tasks;
+using static BK7231Flasher.MiscUtils;
 
 namespace BK7231Flasher
 {
@@ -283,11 +27,7 @@ namespace BK7231Flasher
         static readonly byte[] KEY_NULL = DeriveVaultKey(KEY_PART_2, KEY_PART_2);
         static readonly byte[] KEY_PART_1_D = Encoding.ASCII.GetBytes("8721D");
         static readonly byte[] KEY_PART_1_AM = Encoding.ASCII.GetBytes("8711AM_4M");
-        //static byte[] MAGIC_CONFIG_START = new byte[] { 0x46, 0xDC, 0xED, 0x0E, 0x67, 0x2F, 0x3B, 0x70, 0xAE, 0x12, 0x76, 0xA3, 0xF8, 0x71, 0x2E, 0x03 };
-        // TODO: check more bins with this offset
-        // hex 0x1EE000
-        // While flash is 0x200000, so we have at most 0x12000 bytes there...
-        // So it's 0x12 sectors (18 sectors)
+
         const int USUAL_BK7231_MAGIC_POSITION = 2023424;
         const int USUAL_BK_NEW_XR806_MAGIC_POSITION = 2052096;
         const int USUAL_RTLB_XR809_MAGIC_POSITION = 2011136;
@@ -308,14 +48,253 @@ namespace BK7231Flasher
         int magicPosition = -1;
         byte[] descryptedRaw;
         byte[] original;
-        Dictionary<string, string> parms = new Dictionary<string, string>();
+        Dictionary<string, string> parms = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-        class VaultPage
+        // --------------------------------------------------------------------
+        // JSON-driven mapping structures (load once, used instead of hardcoded switch)
+        // The code below uses spec/tuya-spec.json (relative to app directory or working dir).
+        // If the file is missing or invalid we fail early (per your request, no fallback).
+        // --------------------------------------------------------------------
+
+        class MappingEntry
         {
-            public int FlashOffset;
-            public uint Seq;
-            public byte[] Data;
+            public string? search { get; set; }
+            public string? role { get; set; }          // may be "VALUEONLY", null, or a real role name
+            public string? desc { get; set; }
+            public bool? nochan { get; set; }
+            public int? channel { get; set; }
+            public string? special { get; set; }
+            public string? conditional { get; set; }
+            public int? group { get; set; }
         }
+
+        class SpecRoot
+        {
+            public object? meta { get; set; }
+            public List<MappingEntry>? mappings { get; set; }
+            public Dictionary<string, Dictionary<string, string>>? valueMaps { get; set; }
+        }
+
+        static Dictionary<string, MappingEntry> s_keyMap = new Dictionary<string, MappingEntry>(StringComparer.OrdinalIgnoreCase);
+        static List<(Regex regex, MappingEntry entry)> s_regexList = new List<(Regex, MappingEntry)>();
+        static Dictionary<string, Dictionary<string, string>> s_valueMaps = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+        static bool s_mappingsInitialized = false;
+        static readonly object s_mapLock = new object();
+
+        static void EnsureMappingsLoaded()
+        {
+            if (s_mappingsInitialized) return;
+            lock (s_mapLock)
+            {
+                if (s_mappingsInitialized) return;
+                s_mappingsInitialized = true;
+
+                // locate spec file
+                string baseDir = AppContext.BaseDirectory ?? Directory.GetCurrentDirectory();
+                string[] candidates = new[]
+                {
+                    Path.Combine(baseDir, "spec", "tuya-spec.json"),
+                    Path.Combine(baseDir, "tuya-spec.json"),
+                    Path.Combine(Directory.GetCurrentDirectory(), "spec", "tuya-spec.json"),
+                    Path.Combine(Directory.GetCurrentDirectory(), "tuya-spec.json")
+                };
+
+                string specPath = candidates.FirstOrDefault(File.Exists);
+                if (specPath == null)
+                {
+                    var msg = "TuyaConfig: spec/tuya-spec.json not found. Aborting mapping initialization (no fallback allowed).";
+                    FormMain.Singleton.addLog(msg + Environment.NewLine, System.Drawing.Color.Orange);
+                    throw new FileNotFoundException(msg + " Looked in: " + string.Join("; ", candidates));
+                }
+
+                string raw = File.ReadAllText(specPath, Encoding.UTF8);
+
+                SpecRoot specRoot = null;
+                // Try parsing while skipping comments if possible
+                try
+                {
+                    var docOpts = new JsonDocumentOptions { CommentHandling = JsonCommentHandling.Skip };
+                    using (var doc = JsonDocument.Parse(raw, docOpts))
+                    {
+                        var json = doc.RootElement.GetRawText();
+                        var jopts = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+                        specRoot = JsonSerializer.Deserialize<SpecRoot>(json, jopts);
+                    }
+                }
+                catch
+                {
+                    // fallback: strip comments then parse
+                    try
+                    {
+                        string clean = StripJsonComments(raw);
+                        var jopts = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+                        specRoot = JsonSerializer.Deserialize<SpecRoot>(clean, jopts);
+                    }
+                    catch (Exception ex)
+                    {
+                        var msg = $"TuyaConfig: Failed to parse spec/tuya-spec.json: {ex.Message}";
+                        FormMain.Singleton.addLog(msg + Environment.NewLine, System.Drawing.Color.Orange);
+                        throw new Exception(msg, ex);
+                    }
+                }
+
+                if (specRoot == null || specRoot.mappings == null)
+                {
+                    var msg = "TuyaConfig: spec/tuya-spec.json missing mappings section or empty.";
+                    FormMain.Singleton.addLog(msg + Environment.NewLine, System.Drawing.Color.Orange);
+                    throw new Exception(msg);
+                }
+
+                s_keyMap = new Dictionary<string, MappingEntry>(StringComparer.OrdinalIgnoreCase);
+                s_regexList = new List<(Regex, MappingEntry)>();
+                s_valueMaps = specRoot.valueMaps ?? new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+
+                foreach (var m in specRoot.mappings)
+                {
+                    if (m == null || string.IsNullOrWhiteSpace(m.search)) continue;
+                    var s = m.search.Trim();
+
+                    if (s.Length >= 2 && s[0] == '/' && s[^1] == '/')
+                    {
+                        var body = s.Substring(1, s.Length - 2);
+                        try
+                        {
+                            var rx = new Regex(body, RegexOptions.Compiled | RegexOptions.CultureInvariant);
+                            s_regexList.Add((rx, m));
+                        }
+                        catch (Exception ex)
+                        {
+                            FormMain.Singleton.addLog($"TuyaConfig: invalid regex in spec: {s} -> {ex.Message}" + Environment.NewLine, System.Drawing.Color.Orange);
+                            // Do not fall back; skip this mapping only
+                        }
+                    }
+                    else
+                    {
+                        if (!s_keyMap.ContainsKey(s))
+                            s_keyMap[s] = m;
+                        else
+                        {
+                            FormMain.Singleton.addLog($"TuyaConfig: duplicate mapping for key '{s}' in spec; first kept." + Environment.NewLine, System.Drawing.Color.Orange);
+                        }
+                    }
+                }
+
+                // all loaded
+            }
+        }
+
+        // Simple comment stripper preserving strings (used as fallback)
+        static string StripJsonComments(string input)
+        {
+            var sb = new StringBuilder(input.Length);
+            bool inString = false;
+            char stringChar = '\0';
+            bool escape = false;
+            bool inLineComment = false;
+            bool inBlockComment = false;
+
+            for (int i = 0; i < input.Length; i++)
+            {
+                char ch = input[i];
+                char next = (i + 1 < input.Length) ? input[i + 1] : '\0';
+
+                if (inLineComment)
+                {
+                    if (ch == '\n')
+                    {
+                        inLineComment = false;
+                        sb.Append(ch);
+                    }
+                    continue;
+                }
+
+                if (inBlockComment)
+                {
+                    if (ch == '*' && next == '/')
+                    {
+                        inBlockComment = false;
+                        i++; // skip '/'
+                    }
+                    continue;
+                }
+
+                if (inString)
+                {
+                    sb.Append(ch);
+                    if (!escape && ch == stringChar) inString = false;
+                    escape = (!escape && ch == '\\');
+                    continue;
+                }
+
+                if (ch == '"' || ch == '\'')
+                {
+                    inString = true;
+                    stringChar = ch;
+                    sb.Append(ch);
+                    continue;
+                }
+
+                if (ch == '/' && next == '/')
+                {
+                    inLineComment = true;
+                    i++;
+                    continue;
+                }
+
+                if (ch == '/' && next == '*')
+                {
+                    inBlockComment = true;
+                    i++;
+                    continue;
+                }
+
+                sb.Append(ch);
+            }
+            return sb.ToString();
+        }
+
+        // Map role string to PinRole enum or handle aliases (BridgeFWD etc.)
+        static bool TryApplyMappingToTemplate(MappingEntry m, string key, string value, OBKConfig? tg, int? channelOverride = null)
+        {
+            if (m == null) return false;
+
+            if (string.IsNullOrWhiteSpace(m.role) || string.Equals(m.role, "VALUEONLY", StringComparison.OrdinalIgnoreCase))
+            {
+                // explicitly don't set any pin role
+                return false;
+            }
+
+            // Try direct enum mapping
+            if (Enum.TryParse<PinRole>(m.role, true, out var pr))
+            {
+                int ch = channelOverride ?? m.channel ?? 0;
+                tg?.setPinRole(value, pr);
+                tg?.setPinChannel(value, ch);
+                return true;
+            }
+
+            // Alias mapping - extend as needed
+            switch (m.role)
+            {
+                case "BridgeFWD":
+                    tg?.setPinRole(value, PinRole.Rel);
+                    tg?.setPinChannel(value, channelOverride ?? m.channel ?? 0);
+                    return true;
+                case "BridgeREV":
+                    tg?.setPinRole(value, PinRole.Rel_n);
+                    tg?.setPinChannel(value, channelOverride ?? m.channel ?? 0);
+                    return true;
+                // add other aliases here if your spec uses names that don't match PinRole enum
+                default:
+                    FormMain.Singleton.addLog($"TuyaConfig: Unknown role '{m.role}' for key '{key}' in tuya-spec.json. Skipping setPinRole." + Environment.NewLine, System.Drawing.Color.Orange);
+                    return false;
+            }
+        }
+
+        // --------------------------------------------------------------------
+        // Remaining original TuyaConfig code (key parsing / vault extraction)
+        // Keep unchanged besides the getKeysHumanReadable method which is adapted
+        // --------------------------------------------------------------------
 
         public sealed class KvEntry
         {
@@ -327,7 +306,7 @@ namespace BK7231Flasher
 
             public string Key = "";
             public byte[] Value = Array.Empty<byte>();
-        
+
             public override string ToString()
                 => $"{Key} (len={ValueLength}, valid={IsCheckSumCorrect})";
         }
@@ -335,7 +314,7 @@ namespace BK7231Flasher
         static ushort CalcChecksum(byte[] buf, int off, int len)
         {
             ushort sum = 0;
-            for(int i = off; i < off + len; i++) sum += buf[i];
+            for (int i = off; i < off + len; i++) sum += buf[i];
             return sum;
         }
 
@@ -343,16 +322,16 @@ namespace BK7231Flasher
         {
             entry = null!;
 
-            if(entryOffset + KVHeaderSize > pageData.Length)
+            if (entryOffset + KVHeaderSize > pageData.Length)
                 return false;
 
             uint valueLen = ReadU32LE(pageData, entryOffset + 4);
 
-            if(valueLen == 0 || valueLen > pageData.Length)
+            if (valueLen == 0 || valueLen > pageData.Length)
                 return false;
 
             int totalLength = KVHeaderSize + (int)valueLen;
-            if(entryOffset + totalLength > pageData.Length)
+            if (entryOffset + totalLength > pageData.Length)
                 return false;
 
             var storedChsum = ReadU16LE(pageData, entryOffset);
@@ -362,32 +341,30 @@ namespace BK7231Flasher
             var valOff = 128;
 
             int keyPos = entryOffset + keyOff;
-            if(keyPos < 0 || keyPos >= pageData.Length)
+            if (keyPos < 0 || keyPos >= pageData.Length)
                 return false;
 
             var keyBytes = new List<byte>();
-            for(int i = keyPos; i < keyPos + keyLen; i++)
+            for (int i = keyPos; i < keyPos + keyLen; i++)
             {
                 byte b = pageData[i];
-                if(!(b == 0 || (b >= 0x20 && b <= 0x7E)))
-                	return false;
-                if(b == 0)
+                if (!(b == 0 || (b >= 0x20 && b <= 0x7E)))
+                    return false;
+                if (b == 0)
                     break;
                 keyBytes.Add(b);
             }
 
-            if(keyBytes.Count == 0)
+            if (keyBytes.Count == 0)
                 return false;
 
             string key = Encoding.ASCII.GetString(keyBytes.ToArray());
 
             int valPos = entryOffset + valOff;
-            if(valPos < 0 || valPos + valueLen > pageData.Length)
+            if (valPos < 0 || valPos + valueLen > pageData.Length)
                 return false;
 
             ushort calcChsum = CalcChecksum(pageData, valPos, (int)valueLen);
-            //if(storedChsum != calcChsum)
-            //	return false;
 
             byte[] value = new byte[valueLen];
             Buffer.BlockCopy(pageData, valPos, value, 0, (int)valueLen);
@@ -410,14 +387,14 @@ namespace BK7231Flasher
             var entries = new List<KvEntry>();
             byte[] data = descryptedRaw;
 
-            for(int off = 0; off + KVHeaderSize < data.Length; off += 0x80)
+            for (int off = 0; off + KVHeaderSize < data.Length; off += 0x80)
             {
-                if(TryParseEntry(data, off, out var entry))
+                if (TryParseEntry(data, off, out var entry))
                 {
                     entries.Add(entry);
 
                     int nextOffset = off + 0x80;
-                    if(nextOffset > off)
+                    if (nextOffset > off)
                         off = nextOffset - 0x80;
                 }
             }
@@ -425,35 +402,34 @@ namespace BK7231Flasher
             return entries;
         }
 
-        // pretty useless for RTLs, since littlefs overwrites it.
         internal static int getMagicOffset(BKType type) => type switch
-            {
-                BKType.RTL8710B => USUAL_RTLB_XR809_MAGIC_POSITION,
-                BKType.RTL87X0C => USUAL_RTLC_ECR6600_MAGIC_POSITION,
-                BKType.RTL8720D => USUAL_RTLD_MAGIC_POSITION,
-                BKType.LN882H   => USUAL_LN882H_MAGIC_POSITION,
-                BKType.BK7236   => USUAL_T3_MAGIC_POSITION,
-                BKType.BK7238   => USUAL_BK_NEW_XR806_MAGIC_POSITION,
-                BKType.BK7258   => USUAL_T5_MAGIC_POSITION,
-                BKType.ECR6600  => USUAL_RTLC_ECR6600_MAGIC_POSITION,
-                BKType.LN8825   => USUAL_LN8825_MAGIC_POSITION,
-                BKType.TR6260   => USUAL_TR6260_MAGIC_POSITION,
-                _               => USUAL_BK7231_MAGIC_POSITION,
-            };
+        {
+            BKType.RTL8710B => USUAL_RTLB_XR809_MAGIC_POSITION,
+            BKType.RTL87X0C => USUAL_RTLC_ECR6600_MAGIC_POSITION,
+            BKType.RTL8720D => USUAL_RTLD_MAGIC_POSITION,
+            BKType.LN882H => USUAL_LN882H_MAGIC_POSITION,
+            BKType.BK7236 => USUAL_T3_MAGIC_POSITION,
+            BKType.BK7238 => USUAL_BK_NEW_XR806_MAGIC_POSITION,
+            BKType.BK7258 => USUAL_T5_MAGIC_POSITION,
+            BKType.ECR6600 => USUAL_RTLC_ECR6600_MAGIC_POSITION,
+            BKType.LN8825 => USUAL_LN8825_MAGIC_POSITION,
+            BKType.TR6260 => USUAL_TR6260_MAGIC_POSITION,
+            _ => USUAL_BK7231_MAGIC_POSITION,
+        };
 
         public static int getMagicSize(BKType type) => type switch
         {
             BKType.RTL8710B => 0x200000 - USUAL_RTLB_XR809_MAGIC_POSITION,
             BKType.RTL87X0C => 0x1E5000 - USUAL_RTLC_ECR6600_MAGIC_POSITION,
             BKType.RTL8720D => 0x3FC000 - USUAL_RTLD_MAGIC_POSITION,
-            BKType.LN882H   => 0x200000 - USUAL_LN882H_MAGIC_POSITION,
-            BKType.BK7236   => 0x3E0000 - USUAL_T3_MAGIC_POSITION,
-            BKType.BK7238   => 0x200000 - USUAL_BK_NEW_XR806_MAGIC_POSITION,
-            BKType.BK7258   => 0x7ED000 - USUAL_T5_MAGIC_POSITION,
-            BKType.ECR6600  => 0x1F7000 - USUAL_RTLC_ECR6600_MAGIC_POSITION,
-            BKType.LN8825   => 0x200000 - USUAL_LN8825_MAGIC_POSITION,
-            BKType.TR6260   => 0x0DE000 - USUAL_TR6260_MAGIC_POSITION,
-            _               => 0x200000 - USUAL_BK7231_MAGIC_POSITION,
+            BKType.LN882H => 0x200000 - USUAL_LN882H_MAGIC_POSITION,
+            BKType.BK7236 => 0x3E0000 - USUAL_T3_MAGIC_POSITION,
+            BKType.BK7238 => 0x200000 - USUAL_BK_NEW_XR806_MAGIC_POSITION,
+            BKType.BK7258 => 0x7ED000 - USUAL_T5_MAGIC_POSITION,
+            BKType.ECR6600 => 0x1F7000 - USUAL_RTLC_ECR6600_MAGIC_POSITION,
+            BKType.LN8825 => 0x200000 - USUAL_LN8825_MAGIC_POSITION,
+            BKType.TR6260 => 0x0DE000 - USUAL_TR6260_MAGIC_POSITION,
+            _ => 0x200000 - USUAL_BK7231_MAGIC_POSITION,
         };
 
         public string getMagicPositionHex() => $"0x{magicPosition:X}";
@@ -490,7 +466,7 @@ namespace BK7231Flasher
                 bGivenBinaryIsFullOf0xff = true;
                 return true;
             }
-            if(data.Length>3 && data[0] == (byte)'C' && data[1] == (byte)'F' && data[2] == (byte)'G')
+            if (data.Length > 3 && data[0] == (byte)'C' && data[1] == (byte)'F' && data[2] == (byte)'G')
             {
                 FormMain.Singleton.addLog("It seems that dragged binary is OBK config, not a Tuya one" + Environment.NewLine, System.Drawing.Color.Purple);
                 bLastBinaryOBKConfig = true;
@@ -499,11 +475,11 @@ namespace BK7231Flasher
 
             try
             {
-                if(TryVaultExtract(data)) return false;
+                if (TryVaultExtract(data)) return false;
             }
             finally
             {
-                if(descryptedRaw != null)
+                if (descryptedRaw != null)
                 {
                     string debugName = "lastRawDecryptedStrings.bin";
                     FormMain.Singleton.addLog("Saving debug Tuya decryption data to " + debugName + Environment.NewLine, System.Drawing.Color.DarkSlateGray);
@@ -520,7 +496,7 @@ namespace BK7231Flasher
             descryptedRaw = null;
 
             var deviceKeys = FindDeviceKeys(flash);
-            if(deviceKeys.Count == 0)
+            if (deviceKeys.Count == 0)
             {
                 FormMain.Singleton.addLog("Failed to extract Tuya keys - magic constant header not found in binary" + Environment.NewLine, System.Drawing.Color.Purple);
                 return false;
@@ -541,7 +517,7 @@ namespace BK7231Flasher
             int bestCount = 0;
             var obj = new object();
             var time = Stopwatch.StartNew();
-            foreach(var devKey in deviceKeys)
+            foreach (var devKey in deviceKeys)
             {
                 Parallel.ForEach(baseKeyCandidates, baseKey =>
                 {
@@ -553,23 +529,23 @@ namespace BK7231Flasher
                     using var decryptor = aes.CreateDecryptor();
                     var blockBuffer = new byte[SECTOR_SIZE];
                     var firstBlock = new byte[16];
-                    foreach(var magic in pageMagics)
+                    foreach (var magic in pageMagics)
                     {
                         List<VaultPage> pages = new List<VaultPage>();
 
-                        for(int ofs = 0; ofs + SECTOR_SIZE <= flash.Length; ofs += SECTOR_SIZE)
+                        for (int ofs = 0; ofs + SECTOR_SIZE <= flash.Length; ofs += SECTOR_SIZE)
                         {
                             decryptor.TransformBlock(flash, ofs, 16, firstBlock, 0);
 
                             var pageMagic = ReadU32LE(firstBlock, 0);
-                            if(pageMagic != magic) continue;
+                            if (pageMagic != magic) continue;
 
                             var dec = AESDecrypt(flash, ofs, decryptor, blockBuffer);
 
-                            if(dec == null) continue;
+                            if (dec == null) continue;
 
                             var crc = ReadU32LE(dec, 4);
-                            if(!checkCRC(crc, dec, 8, dec.Length - 8))
+                            if (!checkCRC(crc, dec, 8, dec.Length - 8))
                             {
                                 FormMain.Singleton.addLog($"WARNING - bad block CRC at offset {ofs}" + Environment.NewLine, System.Drawing.Color.Purple);
                                 continue;
@@ -584,9 +560,9 @@ namespace BK7231Flasher
                                 Data = dec
                             });
                         }
-                        lock(obj)
+                        lock (obj)
                         {
-                            if(pages.Count > bestCount)
+                            if (pages.Count > bestCount)
                             {
                                 bestCount = pages.Count;
                                 bestPages = pages;
@@ -596,7 +572,7 @@ namespace BK7231Flasher
                 });
             }
             time.Stop();
-            if(bestPages == null)
+            if (bestPages == null)
             {
                 FormMain.Singleton.addLog("Failed to extract Tuya keys - decryption failed" + Environment.NewLine, System.Drawing.Color.Orange);
                 return false;
@@ -607,16 +583,15 @@ namespace BK7231Flasher
             magicPosition = magicPosition < dataFlashOffset ? magicPosition : dataFlashOffset;
             FormMain.Singleton.addLog($"Tuya config extractor - magic is at {magicPosition} (0x{magicPosition:X}) " + Environment.NewLine, System.Drawing.Color.DarkSlateGray);
 
-            if(bestPages.Count < 2)
+            if (bestPages.Count < 2)
             {
                 FormMain.Singleton.addLog("Failed to extract Tuya keys - config not found" + Environment.NewLine, System.Drawing.Color.Orange);
                 return false;
             }
 
-            //bestPages.Sort((a, b) => a.Seq.CompareTo(b.Seq));
             using var ms = new MemoryStream();
             using var bw = new BinaryWriter(ms);
-            foreach(var p in bestPages) bw.Write(p.Data, 0, p.Data.Length);
+            foreach (var p in bestPages) bw.Write(p.Data, 0, p.Data.Length);
 
             descryptedRaw = ms.ToArray();
             return true;
@@ -624,10 +599,10 @@ namespace BK7231Flasher
 
         static byte[] DeriveVaultKey(byte[] baseKey, byte[] deviceKey)
         {
-            if(baseKey.Length != 16)
+            if (baseKey.Length != 16)
                 throw new Exception($"baseKey.Length != 16 ({baseKey.Length}");
             var vaultKey = new byte[16];
-            if(deviceKey.Length != 16)
+            if (deviceKey.Length != 16)
             {
                 for (int i = 0; i < 16; i++)
                 {
@@ -636,7 +611,7 @@ namespace BK7231Flasher
                 }
                 return vaultKey;
             }
-            for(int i = 0; i < 16; i++) vaultKey[i] = (byte)((baseKey[i] + deviceKey[i]) & 0xFF);
+            for (int i = 0; i < 16; i++) vaultKey[i] = (byte)((baseKey[i] + deviceKey[i]) & 0xFF);
             return vaultKey;
         }
 
@@ -652,29 +627,25 @@ namespace BK7231Flasher
             using var decryptor = aes.CreateDecryptor();
             var blockBuffer = new byte[SECTOR_SIZE];
             var dec = new byte[16];
-            for(int ofs = 0; ofs + SECTOR_SIZE <= flash.Length; ofs += SECTOR_SIZE)
+            for (int ofs = 0; ofs + SECTOR_SIZE <= flash.Length; ofs += SECTOR_SIZE)
             {
                 decryptor.TransformBlock(flash, ofs, 16, dec, 0);
 
                 var pageMagic = ReadU32LE(dec, 0);
-                if(pageMagic != MAGIC_FIRST_BLOCK) continue;
+                if (pageMagic != MAGIC_FIRST_BLOCK) continue;
 
                 dec = AESDecrypt(flash, ofs, decryptor, blockBuffer);
-                if(dec == null) continue;
+                if (dec == null) continue;
 
                 var dk = new byte[16];
                 Array.Copy(dec, 8, dk, 0, 16);
 
                 var crc = ReadU32LE(dec, 4);
-                if(checkCRC(crc, dk, 0, 16))
+                if (checkCRC(crc, dk, 0, 16))
                 {
                     keys.Add(dk);
                     magicPosition = ofs;
                 }
-                //else
-                //{
-                //    FormMain.Singleton.addLog("WARNING - bad firstblock crc" + Environment.NewLine, System.Drawing.Color.Purple);
-                //}
             }
             return keys;
         }
@@ -685,97 +656,109 @@ namespace BK7231Flasher
             return decryptor.TransformFinalBlock(buffer, 0, SECTOR_SIZE);
         }
 
+        // New JSON-driven getKeysHumanReadable
         public string getKeysHumanReadable(OBKConfig tg = null)
         {
-            bool bHasBattery = false;
-            string desc = "";
-            if(tg != null && !string.IsNullOrWhiteSpace(tg.initCommandLine)) tg.initCommandLine += "\r\n";
+            EnsureMappingsLoaded();
 
-		// before iterating ensure mappings loaded
-		EnsureMappingsLoaded();
+            var descSb = new StringBuilder();
+            bool any = false;
 
-		foreach (var kv in parms)
-		{
-		    string key = kv.Key;
-		    string value = kv.Value;
+            // We only produce lines for keys matched in the spec (no internal fallback)
+            foreach (var kv in parms)
+            {
+                string key = kv.Key;
+                string value = kv.Value;
 
-		    bool matched = false;
+                MappingEntry mapping = null;
 
-		    // 1) exact key match
-		    if (s_keyMap != null && s_keyMap.TryGetValue(key, out var mapping))
-		    {
-			matched = true;
-			// replace placeholders in desc
-			string descLine = (mapping.desc ?? "").Replace("{value}", value).Replace("{number}", mapping.channel.HasValue ? mapping.channel.Value.ToString() : "");
-			desc += descLine + Environment.NewLine;
-			// apply PinRole if mapping.role yields a real role
-			TryApplyMappingToTemplate(mapping, key, value, tg);
-		    }
-		    else if (s_regexList != null)
-		    {
-			// 2) try regex matches (in the declared order)
-			foreach (var (rx, m) in s_regexList)
-			{
-			    var mm = rx.Match(key);
-			    if (!mm.Success) continue;
-			    matched = true;
-			    // extract numeric group if present (use mapping.group if defined)
-			    int? number = null;
-			    if (m.group.HasValue)
-			    {
-				var g = m.group.Value;
-				if (g >= 0 && g < mm.Groups.Count)
-				{
-				    var raw = mm.Groups[g].Value;
-				    if (!string.IsNullOrEmpty(raw))
-				    {
-				        if (int.TryParse(raw, out var n)) number = n;
-				    }
-				}
-			    }
-			    else if (mm.Groups.Count > 1)
-			    {
-				var raw = mm.Groups[1].Value;
-				if (!string.IsNullOrEmpty(raw) && int.TryParse(raw, out var n)) number = n;
-			    }
+                // exact key
+                if (s_keyMap.TryGetValue(key, out var mExact))
+                {
+                    mapping = mExact;
+                }
+                else
+                {
+                    // regex
+                    foreach (var (rx, me) in s_regexList)
+                    {
+                        var mm = rx.Match(key);
+                        if (!mm.Success) continue;
+                        // copy mapping so we can compute channel from group if needed
+                        mapping = me;
+                        // determine number/group and place into m.channel temporarily via a local
+                        int? number = null;
+                        if (mapping.group.HasValue)
+                        {
+                            int g = mapping.group.Value;
+                            if (g >= 0 && g < mm.Groups.Count)
+                            {
+                                var raw = mm.Groups[g].Value;
+                                if (!string.IsNullOrEmpty(raw) && int.TryParse(raw, out var n)) number = n;
+                            }
+                        }
+                        else if (mm.Groups.Count > 1)
+                        {
+                            var raw = mm.Groups[1].Value;
+                            if (!string.IsNullOrEmpty(raw) && int.TryParse(raw, out var n)) number = n;
+                        }
 
-			    // desc replacement
-			    string descLine = (m.desc ?? "").Replace("{value}", value).Replace("{number}", number.HasValue ? number.Value.ToString() : "");
-			    desc += descLine + Environment.NewLine;
+                        // Build description and apply mapping using number if present
+                        string line = (mapping.desc ?? "").Replace("{value}", value).Replace("{number}", number.HasValue ? number.Value.ToString() : "");
+                        descSb.AppendLine(line);
+                        any = true;
 
-			    // if mapping defines channel and nochan==false prefer mapping.channel else use number
-			    if (m.channel.HasValue)
-			    {
-				// mapping has fixed channel e.g. PWM r/g/b
-				m.channel = m.channel; // keep as-is
-			    }
-			    else
-			    {
-				// pass number to TryApplyMappingToTemplate through m.channel (temporary)
-				if (number.HasValue) m.channel = number.Value;
-			    }
+                        // apply mapping (use number as override for channel if present)
+                        TryApplyMappingToTemplate(mapping, key, value, tg, number);
+                        // stop at first matching regex
+                        mapping = null; // we've already processed it
+                        break;
+                    }
+                }
 
-			    TryApplyMappingToTemplate(m, key, value, tg);
+                // if exact mapping found, handle it
+                if (mapping != null)
+                {
+                    // value maps (human readable)
+                    if (!string.IsNullOrEmpty(mapping.role) && string.Equals(mapping.role, "VALUEONLY", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // produce description with value and optionally map via valueMaps
+                        string human = value;
+                        if (s_valueMaps != null && s_valueMaps.TryGetValue(key, out var vm))
+                        {
+                            if (vm.TryGetValue(value ?? "", out var mapped)) human = $"{value} ({mapped})";
+                            else
+                            {
+                                var possible = string.Join(", ", vm.Select(kv2 => $"{kv2.Key}={kv2.Value}"));
+                                human = $"{value} (Unknown). Known: {possible}";
+                            }
+                        }
+                        string line = (mapping.desc ?? "").Replace("{value}", human).Replace("{number}", mapping.channel.HasValue ? mapping.channel.Value.ToString() : "");
+                        descSb.AppendLine(line);
+                        any = true;
+                        // do not apply pin role for VALUEONLY
+                    }
+                    else
+                    {
+                        string line = (mapping.desc ?? "").Replace("{value}", value).Replace("{number}", mapping.channel.HasValue ? mapping.channel.Value.ToString() : "");
+                        descSb.AppendLine(line);
+                        any = true;
+                        TryApplyMappingToTemplate(mapping, key, value, tg);
+                    }
+                }
+            }
 
-			    break; // stop after first matching regex
-			}
-		    }
-
-		    // If not matched by spec, you can optionally fallback to the original switch logic here
-		    if (!matched)
-		    {
-			// existing fallback (optional): keep your original switch-case snippet here for keys missing in JSON
-			// e.g. switch(key) { case "irpin": ... } or leave empty to ignore unknown keys.
-		    }
-		} 
-            
-            
-            // LED
+            // Special: run I2C LED detection block if the parsed keys indicate it.
+            // Many mappings for i2c are marked with special:"i2c" in the spec; here we detect iicscl/iicsda keys.
             string iicscl = getKeyValue("iicscl");
             string iicsda = getKeyValue("iicsda");
-            if (iicscl.Length > 0 && iicsda.Length > 0)
+            if (string.IsNullOrEmpty(iicscl)) iicscl = getKeyValue("i2c_scl_pin");
+            if (string.IsNullOrEmpty(iicsda)) iicsda = getKeyValue("i2c_sda_pin");
+
+            if (!string.IsNullOrEmpty(iicscl) && !string.IsNullOrEmpty(iicsda))
             {
-                string iicr = getKeyValue("iicr","-1");
+                // replicate earlier LED-detection logic, reading currents etc.
+                string iicr = getKeyValue("iicr", "-1");
                 string iicg = getKeyValue("iicg", "-1");
                 string iicb = getKeyValue("iicb", "-1");
                 string iicc = getKeyValue("iicc", "-1");
@@ -794,17 +777,16 @@ namespace BK7231Flasher
                 string cjccur = getKeyValue("cjccur");
                 string _2235ccur = getKeyValue("2235ccur");
                 string _2235wcur = getKeyValue("2235wcur");
-                string _2335ccur = getKeyValue("2335ccur");
                 string kp58wcur = getKeyValue("kp58wcur");
                 string kp58ccur = getKeyValue("kp58ccur");
                 string currents = string.Empty;
                 bool isExc = false;
-                // use current (color/cw) setting
-                if (ehccur.Length>0 || wampere.Length > 0 || iicccur.Length > 0)
+
+                if (ehccur.Length > 0 || wampere.Length > 0 || iicccur.Length > 0)
                 {
                     ledType = "SM2135";
-                    var rgbcurrent = 0;
-                    var cwcurrent = 0;
+                    var rgbcurrent = 1;
+                    var cwcurrent = 1;
                     try
                     {
                         rgbcurrent = ehccur.Length > 0 ? Convert.ToInt32(ehccur) : iicccur.Length > 0 ? Convert.ToInt32(iicccur) : campere.Length > 0 ? Convert.ToInt32(campere) : 1;
@@ -816,19 +798,19 @@ namespace BK7231Flasher
                     }
                     finally
                     {
-                        if(tg != null && !isExc) tg.initCommandLine += $"SM2135_Current {rgbcurrent} {cwcurrent}\r\n";
+                        if (tg != null && !isExc) tg.initCommandLine += $"SM2135_Current {rgbcurrent} {cwcurrent}\r\n";
                     }
-                    currents =  $"- RGB current is {(ehccur.Length > 0 ? ehccur : iicccur.Length > 0 ? iicccur : campere.Length > 0 ? campere : "Unknown")} mA{Environment.NewLine}";
-                    currents += $"- White current is {(ehwcur.Length > 0 ? ehwcur : iicwcur.Length > 0 ? iicwcur : wampere.Length > 0 ? wampere : "Unknown")} mA{Environment.NewLine}";
+                    currents = $"- RGB current is {(ehccur.Length > 0 ? ehccur : iicccur.Length > 0 ? iicccur : campere.Length > 0 ? campere : "Unknown")} mA" + Environment.NewLine;
+                    currents += $"- White current is {(ehwcur.Length > 0 ? ehwcur : iicwcur.Length > 0 ? iicwcur : wampere.Length > 0 ? wampere : "Unknown")} mA" + Environment.NewLine;
                     tg?.setPinRole(iicsda, PinRole.SM2135DAT);
                     tg?.setPinRole(iicscl, PinRole.SM2135CLK);
                 }
                 else if (dccur.Length > 0)
                 {
                     ledType = "BP5758D_";
-                    var rgbcurrent = 0;
-                    var wcurrent = 0;
-                    var ccurrent = 0;
+                    var rgbcurrent = 1;
+                    var wcurrent = 1;
+                    var ccurrent = 1;
                     try
                     {
                         rgbcurrent = drgbcur.Length > 0 ? Convert.ToInt32(drgbcur) : 1;
@@ -841,19 +823,19 @@ namespace BK7231Flasher
                     }
                     finally
                     {
-                        if(tg != null && !isExc) tg.initCommandLine += $"BP5758D_Current {rgbcurrent} {Math.Max(wcurrent, ccurrent)}\r\n";
+                        if (tg != null && !isExc) tg.initCommandLine += $"BP5758D_Current {rgbcurrent} {Math.Max(wcurrent, ccurrent)}\r\n";
                     }
-                    currents =  $"- RGB current is {(drgbcur.Length > 0 ? drgbcur : "Unknown")} mA{Environment.NewLine}";
-                    currents += $"- Warm white current is {(dwcur.Length > 0 ? dwcur : "Unknown")} mA{Environment.NewLine}";
-                    currents += $"- Cold white current is {(dccur.Length > 0 ? dccur : "Unknown")} mA{Environment.NewLine}";
+                    currents = $"- RGB current is {(drgbcur.Length > 0 ? drgbcur : "Unknown")} mA" + Environment.NewLine;
+                    currents += $"- Warm white current is {(dwcur.Length > 0 ? dwcur : "Unknown")} mA" + Environment.NewLine;
+                    currents += $"- Cold white current is {(dccur.Length > 0 ? dccur : "Unknown")} mA" + Environment.NewLine;
                     tg?.setPinRole(iicsda, PinRole.BP5758D_DAT);
                     tg?.setPinRole(iicscl, PinRole.BP5758D_CLK);
                 }
                 else if (cjwcur.Length > 0)
                 {
                     ledType = "BP1658CJ_";
-                    var rgbcurrent = 0;
-                    var cwcurrent = 0;
+                    var rgbcurrent = 1;
+                    var cwcurrent = 1;
                     try
                     {
                         rgbcurrent = cjccur.Length > 0 ? Convert.ToInt32(cjccur) : 1;
@@ -865,18 +847,18 @@ namespace BK7231Flasher
                     }
                     finally
                     {
-                        if(tg != null && !isExc) tg.initCommandLine += $"BP1658CJ_Current {rgbcurrent} {cwcurrent}\r\n";
+                        if (tg != null && !isExc) tg.initCommandLine += $"BP1658CJ_Current {rgbcurrent} {cwcurrent}\r\n";
                     }
-                    currents =  $"- RGB current is {(cjccur.Length > 0 ? cjccur : "Unknown")} mA{Environment.NewLine}";
-                    currents += $"- White current is {(cjwcur.Length > 0 ? cjwcur : "Unknown")} mA{Environment.NewLine}";
+                    currents = $"- RGB current is {(cjccur.Length > 0 ? cjccur : "Unknown")} mA" + Environment.NewLine;
+                    currents += $"- White current is {(cjwcur.Length > 0 ? cjwcur : "Unknown")} mA" + Environment.NewLine;
                     tg?.setPinRole(iicsda, PinRole.BP1658CJ_DAT);
                     tg?.setPinRole(iicscl, PinRole.BP1658CJ_CLK);
                 }
                 else if (_2235ccur.Length > 0)
                 {
                     ledType = "SM2235";
-                    var rgbcurrent = 0;
-                    var cwcurrent = 0;
+                    var rgbcurrent = 1;
+                    var cwcurrent = 1;
                     try
                     {
                         rgbcurrent = _2235ccur.Length > 0 ? Convert.ToInt32(_2235ccur) : 1;
@@ -888,18 +870,18 @@ namespace BK7231Flasher
                     }
                     finally
                     {
-                        if(tg != null && !isExc) tg.initCommandLine += $"SM2235_Current {rgbcurrent} {cwcurrent}\r\n";
+                        if (tg != null && !isExc) tg.initCommandLine += $"SM2235_Current {rgbcurrent} {cwcurrent}\r\n";
                     }
-                    currents =  $"- RGB current is {(_2235ccur.Length > 0 ? _2235ccur : "Unknown")} mA{Environment.NewLine}";
-                    currents += $"- White current is {(_2235wcur.Length > 0 ? _2235wcur : "Unknown")} mA{Environment.NewLine}";
+                    currents = $"- RGB current is {(_2235ccur.Length > 0 ? _2235ccur : "Unknown")} mA" + Environment.NewLine;
+                    currents += $"- White current is {(_2235wcur.Length > 0 ? _2235wcur : "Unknown")} mA" + Environment.NewLine;
                     tg?.setPinRole(iicsda, PinRole.SM2235DAT);
                     tg?.setPinRole(iicscl, PinRole.SM2235CLK);
                 }
                 else if (kp58wcur.Length > 0)
                 {
                     ledType = "KP18058_";
-                    var rgbcurrent = 0;
-                    var cwcurrent = 0;
+                    var rgbcurrent = 1;
+                    var cwcurrent = 1;
                     try
                     {
                         rgbcurrent = kp58wcur.Length > 0 ? Convert.ToInt32(kp58wcur) : 1;
@@ -911,22 +893,19 @@ namespace BK7231Flasher
                     }
                     finally
                     {
-                        if(tg != null && !isExc) tg.initCommandLine += $"KP18058_Current {rgbcurrent} {cwcurrent}\r\n";
+                        if (tg != null && !isExc) tg.initCommandLine += $"KP18058_Current {rgbcurrent} {cwcurrent}\r\n";
                     }
-                    currents =  $"- RGB current is {(kp58wcur.Length > 0 ? kp58wcur : "Unknown")} mA{Environment.NewLine}";
-                    currents += $"- White current is {(kp58ccur.Length > 0 ? kp58ccur : "Unknown")} mA{Environment.NewLine}";
+                    currents = $"- RGB current is {(kp58wcur.Length > 0 ? kp58wcur : "Unknown")} mA" + Environment.NewLine;
+                    currents += $"- White current is {(kp58ccur.Length > 0 ? kp58ccur : "Unknown")} mA" + Environment.NewLine;
                     tg?.setPinRole(iicsda, PinRole.KP18058_DAT);
                     tg?.setPinRole(iicscl, PinRole.KP18058_CLK);
                 }
-                else
-                {
 
-                }
                 string dat_name = ledType + "DAT";
                 string clk_name = ledType + "CLK";
-                desc += "- " + dat_name + " on P" + iicsda + Environment.NewLine;
-                desc += "- " + clk_name + " on P" + iicscl + Environment.NewLine;
-                string map = "" + iicr + " " + iicg + " " + iicb + " " + iicc + " " + iicw;
+                descSb.AppendLine($"- {dat_name} on P{iicsda}");
+                descSb.AppendLine($"- {clk_name} on P{iicscl}");
+                string map = $"{iicr} {iicg} {iicb} {iicc} {iicw}";
                 isExc = false;
                 try
                 {
@@ -938,74 +917,84 @@ namespace BK7231Flasher
                 }
                 finally
                 {
-                    if(tg != null && !isExc) tg.initCommandLine += $"LED_Map {map}\r\n";
+                    if (tg != null && !isExc) tg.initCommandLine += $"LED_Map {map}\r\n";
                 }
-                desc += "- LED remap is " + map + Environment.NewLine;
-                desc += currents;
+                descSb.AppendLine("- LED remap is " + map);
+                descSb.AppendLine(currents);
+                any = true;
             }
-            if (desc.Length > 0)
+
+            if (!any)
             {
-                desc = "Device configuration, as extracted from Tuya: " + Environment.NewLine + desc;
+                return "Sorry, no meaningful pins data found. This device may be TuyaMCU or a custom one with no Tuya config data." + Environment.NewLine;
             }
-            else
-            {
-                desc = "Sorry, no meaningful pins data found. This device may be TuyaMCU or a custom one with no Tuya config data." + Environment.NewLine;
-            }
+
+            string result = "Device configuration, as extracted from Tuya: " + Environment.NewLine + descSb.ToString();
+
+            // battery note
+            bool bHasBattery = parms.ContainsKey("max_V") || parms.ContainsKey("min_V");
             if (bHasBattery)
             {
-                desc += "Device seems to use Battery Driver. See more details here: https://www.elektroda.com/rtvforum/topic3959103.html" + Environment.NewLine;
+                result += "Device seems to use Battery Driver. See more details here: https://www.elektroda.com/rtvforum/topic3959103.html" + Environment.NewLine;
             }
+
+            // module/baud info (preserve behavior)
             var baud = this.findKeyValue("baud");
-            if(baud != null)
+            if (baud != null)
             {
-                desc += "Baud keyword found, this device may be TuyaMCU or BL0942. Baud value is " + baud + Environment.NewLine;
+                result += "Baud keyword found, this device may be TuyaMCU or BL0942. Baud value is " + baud + Environment.NewLine;
             }
             var kp = this.findKeyValue("module");
             kp ??= this.findKeyContaining("module");
             if (kp != null)
             {
                 var type = TuyaModules.getTypeForModuleName(kp);
-                desc += "Device seems to be using " + kp + " module";
-                if(type != nameof(BKType.Invalid))
+                result += "Device seems to be using " + kp + " module";
+                if (type != nameof(BKType.Invalid))
                 {
-                    desc += ", which is using " + type + ".";
+                    result += ", which is using " + type + ".";
                 }
                 else
                 {
-                    desc += ".";
+                    result += ".";
                 }
             }
             else
             {
-                desc += "No module information found.";
+                result += "No module information found.";
             }
+
+            result += Environment.NewLine;
             kp = findKeyValue("em_sys_env");
-            if(kp != null)
+            if (kp != null)
             {
-                desc += Environment.NewLine;
+                result += Environment.NewLine;
                 var type = TuyaModules.getTypeForPlatformName(kp);
-                desc += $"Device internal platform - {kp}";
-                if(type != nameof(BKType.Invalid))
+                result += $"Device internal platform - {kp}";
+                if (type != nameof(BKType.Invalid))
                 {
-                    desc += ", equals " + type + ".";
+                    result += ", equals " + type + ".";
                 }
                 else
                 {
-                    desc += ".";
+                    result += ".";
                 }
             }
-            desc += Environment.NewLine;
+
+            result += Environment.NewLine;
+
+            // print position info (same as before)
             void printposdevice(string device)
             {
-                desc += $"And the Tuya section starts at {getMagicPositionDecAndHex()}, which is a default {device} offset." + Environment.NewLine;
+                result += $"And the Tuya section starts at {getMagicPositionDecAndHex()}, which is a default {device} offset." + Environment.NewLine;
             }
-            switch(magicPosition)
+            switch (magicPosition)
             {
                 case 0:
                 case 0x1000:
                     break;
                 case USUAL_BK7231_MAGIC_POSITION:
-                    desc += $"And the Tuya section starts, as usual, at {getMagicPositionDecAndHex()}" + Environment.NewLine;
+                    result += $"And the Tuya section starts, as usual, at {getMagicPositionDecAndHex()}" + Environment.NewLine;
                     break;
                 case USUAL_BK_NEW_XR806_MAGIC_POSITION:
                     printposdevice("T1/XR806 and some T34/BK7231N");
@@ -1047,26 +1036,28 @@ namespace BK7231Flasher
                     printposdevice("BK7252");
                     break;
                 default:
-                    desc += "And the Tuya section starts at an UNCOMMON POSITION " + getMagicPositionDecAndHex() + Environment.NewLine;
+                    result += "And the Tuya section starts at an UNCOMMON POSITION " + getMagicPositionDecAndHex() + Environment.NewLine;
                     break;
-
             }
-            return desc;
+
+            return result;
         }
+
         public string getKeyValue(string key, string sdefault = "")
         {
-            if(parms.TryGetValue(key, out var value))
+            if (parms.TryGetValue(key, out var value))
                 return value;
             return sdefault;
         }
+
         public string getKeysAsJSON()
         {
             string r = "{";
-            foreach(var kv in parms)
+            foreach (var kv in parms)
             {
                 r += Environment.NewLine + $"\t\"{kv.Key}\":\"{kv.Value}\",";
             }
-            if(parms.Count > 0)
+            if (parms.Count > 0)
             {
                 r = r.Substring(0, r.Length - 1); // remove last ','
                 r += Environment.NewLine;
@@ -1074,6 +1065,7 @@ namespace BK7231Flasher
             r += "}" + Environment.NewLine;
             return r;
         }
+
         public bool extractKeys()
         {
             var KVs = ParseVault();
@@ -1088,51 +1080,50 @@ namespace BK7231Flasher
                 KVs_Deduped.FirstOrDefault(x => x.Key == "baud_cfg" && x.IsCheckSumCorrect == true)?.Value;
             byte[] em_sys_env = KVs_Deduped.FirstOrDefault(x => x.Key == "em_sys_env" && x.IsCheckSumCorrect == true)?.Value;
             // old method. Works better when user_param_key is corrupted (bad checksum)
-            if(str == null)
+            if (str == null)
             {
-                if(KVs.Any(x => x.Key == "user_param_key"))
+                if (KVs.Any(x => x.Key == "user_param_key"))
                     FormMain.Singleton.addLog("Tuya user_param_key is corrupted, using old extraction method" + Environment.NewLine, System.Drawing.Color.Orange);
                 int first_at = 0;
                 int keys_at = MiscUtils.indexOf(descryptedRaw, Encoding.ASCII.GetBytes("user_param_key"));
-                //var t = Encoding.ASCII.GetString(descryptedRaw.Where(x => x != 0).ToArray());
                 if (keys_at == -1)
                 {
                     int jsonAt = MiscUtils.indexOf(descryptedRaw, Encoding.ASCII.GetBytes("Jsonver"));
-                    if(jsonAt != -1)
+                    if (jsonAt != -1)
                     {
                         keys_at = MiscUtils.findFirstRev(descryptedRaw, (byte)'{', jsonAt);
                     }
                     if (keys_at == -1)
                     {
                         keys_at = MiscUtils.indexOf(descryptedRaw, Encoding.ASCII.GetBytes("ap_s{"));
-                
-                        if(keys_at == -1)
+
+                        if (keys_at == -1)
                         {
                             keys_at = MiscUtils.indexOf(descryptedRaw, Encoding.ASCII.GetBytes("baud_cfg"));
-                            if(keys_at == -1)
+                            if (keys_at == -1)
                             {
                                 // ln882h hack
                                 int jsonInOrig = MiscUtils.indexOf(original, Encoding.ASCII.GetBytes("crc:"));
-                                if(jsonInOrig != -1 && original[jsonInOrig + 6] == ',' && original[jsonInOrig + 7] == '}')
+                                if (jsonInOrig != -1 && original[jsonInOrig + 6] == ',' && original[jsonInOrig + 7] == '}')
                                 {
                                     keys_at = jsonInOrig;
                                     descryptedRaw = original;
-                                    while(descryptedRaw[keys_at] != '{' && keys_at <= descryptedRaw.Length)
+                                    while (descryptedRaw[keys_at] != '{' && keys_at <= descryptedRaw.Length)
                                         keys_at--;
                                     keys_at--;
                                 }
                                 // extract at least something
-                                if(keys_at == -1)
+                                if (keys_at == -1)
                                 {
                                     keys_at = MiscUtils.indexOf(descryptedRaw, Encoding.ASCII.GetBytes("gw_bi"));
-                                    if(keys_at == -1)
+                                    if (keys_at == -1)
                                     {
                                         FormMain.Singleton.addLog("Failed to extract Tuya keys - no json start found" + Environment.NewLine, System.Drawing.Color.Orange);
                                         return true;
                                     }
                                 }
                             }
-                            while(descryptedRaw[keys_at] != '{' && keys_at <= descryptedRaw.Length)
+                            while (descryptedRaw[keys_at] != '{' && keys_at <= descryptedRaw.Length)
                                 keys_at++;
                             keys_at++;
                             first_at = keys_at;
@@ -1149,7 +1140,7 @@ namespace BK7231Flasher
                 }
                 else
                 {
-                    while(descryptedRaw[keys_at] != '{' && keys_at <= descryptedRaw.Length)
+                    while (descryptedRaw[keys_at] != '{' && keys_at <= descryptedRaw.Length)
                         keys_at++;
                     keys_at++;
                     first_at = keys_at;
@@ -1157,8 +1148,6 @@ namespace BK7231Flasher
                 int stopAT = MiscUtils.findMatching(descryptedRaw, (byte)'}', (byte)'{', first_at);
                 if (stopAT == -1)
                 {
-                    //FormMain.Singleton.addLog("Failed to extract Tuya keys - no json end found" + Environment.NewLine, System.Drawing.Color.Purple);
-                    // return true;
                     stopAT = descryptedRaw.Length;
                 }
                 str = MiscUtils.subArray(descryptedRaw, first_at, stopAT - first_at);
@@ -1167,10 +1156,10 @@ namespace BK7231Flasher
             // let's skip it in a quick and dirty way
             string asciiString = bytesToAsciiStr(str);
             string[] pairs = asciiString.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
-            for(int i = 0; i < pairs.Length; i++)
+            for (int i = 0; i < pairs.Length; i++)
             {
-                string []kp = pairs[i].Split(new char[] { ':' }, StringSplitOptions.RemoveEmptyEntries);
-                if(kp.Length < 2)
+                string[] kp = pairs[i].Split(new char[] { ':' }, StringSplitOptions.RemoveEmptyEntries);
+                if (kp.Length < 2)
                 {
                     FormMain.Singleton.addLog("Malformed key? " + Environment.NewLine, System.Drawing.Color.Orange);
 
@@ -1180,13 +1169,12 @@ namespace BK7231Flasher
                 string svalue = kp[kp.Length - 1];
                 skey = skey.Trim(new char[] { '"' }).Replace("\"", "").Replace("[", "").Replace("{", "");
                 svalue = svalue.Trim(new char[] { '"' }).Replace("\"", "").Replace("}", "");
-                //parms.Add(skey, svalue);
                 if (findKeyValue(skey) == null)
                 {
                     parms.Add(skey, svalue);
                 }
             }
-            if(em_sys_env != null && !isFullOf(em_sys_env, 0x00))
+            if (em_sys_env != null && !isFullOf(em_sys_env, 0x00))
             {
                 parms.Add("em_sys_env", bytesToAsciiStr(em_sys_env));
             }
@@ -1194,43 +1182,43 @@ namespace BK7231Flasher
 
             return false;
         }
+
         string findKeyContaining(string key)
         {
-            foreach(var kv in parms)
+            foreach (var kv in parms)
             {
-                if (kv.Key.Contains(key))
+                if (kv.Key.Contains(key, StringComparison.OrdinalIgnoreCase))
                     return kv.Value;
             }
             return null;
         }
+
         string findKeyValue(string key)
         {
-            if(parms.TryGetValue(key, out var value))
+            if (parms.TryGetValue(key, out var value))
                 return value;
             return null;
         }
-        bool checkCRC(uint expected, byte [] dat, int ofs, int len)
+
+        bool checkCRC(uint expected, byte[] dat, int ofs, int len)
         {
             uint n = 0;
-            for(int i = 0; i < len; i++)
+            for (int i = 0; i < len; i++)
             {
                 n += dat[ofs + i];
             }
             n &= 0xFFFFFFFF;
-            if (n == expected)
-                return true;
-            return false;
+            return n == expected;
         }
+
         string bytesToAsciiStr(byte[] data)
         {
             var asciiString = "";
-            for(int i = 0; i < data.Length; i++)
+            for (int i = 0; i < data.Length; i++)
             {
                 byte b = data[i];
-                if (b < 32)
-                    continue;
-                if (b > 127)
-                    continue;
+                if (b < 32) continue;
+                if (b > 127) continue;
                 char ch = (char)b;
                 asciiString += ch;
             }
