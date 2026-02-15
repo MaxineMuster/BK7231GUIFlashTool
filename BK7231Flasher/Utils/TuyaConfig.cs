@@ -14,9 +14,8 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
-using Newtonsoft.Json;
-using Newtonsoft.Json.Linq;
 using static BK7231Flasher.MiscUtils;
+using System.Text.Json;
 
 namespace BK7231Flasher
 {
@@ -161,13 +160,21 @@ namespace BK7231Flasher
                 SpecRoot root = null;
                 try
                 {
-                    // Use JsonTextReader with CommentHandling.Ignore so C-style comments are allowed
-                    using (var sr = new StringReader(raw))
-                    using (var jr = new JsonTextReader(sr) { CommentHandling = CommentHandling.Ignore })
-                    {
-                        var jo = JObject.Load(jr);
-                        root = jo.ToObject<SpecRoot>();
-                    }
+                	using System.Text.Json;
+                	// parse with System.Text.Json 
+                	var jopts = new JsonSerializerOptions { PropertyNameCaseInsensitive = true }; 
+                	SpecRoot root; 
+                	try 
+                	{ 
+                		root = JsonSerializer.Deserialize<SpecRoot>(raw, jopts);
+                	}
+                	catch (Exception ex) 
+                	{ 
+                		string msg = "TuyaConfig: Failed to parse spec/tuya-spec.json with System.Text.Json: " + ex.Message; 
+                		FormMain.Singleton.addLog(msg + Environment.NewLine, System.Drawing.Color.Orange); 
+                		throw new Exception(msg, ex);
+                	}
+
                 }
                 catch (Exception ex)
                 {
