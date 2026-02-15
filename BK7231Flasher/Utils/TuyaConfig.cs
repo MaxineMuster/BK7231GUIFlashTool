@@ -170,7 +170,7 @@ namespace BK7231Flasher
                         var jo = JObject.Load(jr);
                         root = jo.ToObject<SpecRoot>();
                     }
-*/
+
 //                	using System.Text.Json;
                 	// parse with System.Text.Json 
                 	var jopts = new JsonSerializerOptions { PropertyNameCaseInsensitive = true }; 
