@@ -31,7 +31,7 @@ jobs:
       - name: Copy spec files
         run: |
           mkdir -p BuildOutput/Release/spec
-          copy Utils/spec/tuya-spec.json BuildOutput/Release/spec/
+          copy BK7231Flasher/Utils/spec/tuya-spec.json BuildOutput/Release/spec/
 
       - name: Debug Build Output
         run: |
