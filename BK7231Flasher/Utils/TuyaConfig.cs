@@ -16,6 +16,7 @@ using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using static BK7231Flasher.MiscUtils;
 using System.Text.Json;
+using System.Text.Json.Serialization; 
 
 namespace BK7231Flasher
 {
@@ -120,6 +121,7 @@ namespace BK7231Flasher
         static bool s_mappingsInitialized = false;
         static readonly object s_mapLock = new object();
 
+/*
         // EnsureMappingsLoaded: loads spec/tuya-spec.json; throws on failure (no fallback)
         static void EnsureMappingsLoaded()
         {
@@ -236,7 +238,101 @@ namespace BK7231Flasher
                 s_mappingsInitialized = true;
             }
         }
+*/
 
+	static void EnsureMappingsLoaded()
+	{
+	    if (s_mappingsInitialized) return;
+	    lock (s_mapLock)
+	    {
+		if (s_mappingsInitialized) return;
+		// locate spec file
+		string baseDir = AppContext.BaseDirectory;
+		if (string.IsNullOrEmpty(baseDir)) baseDir = Directory.GetCurrentDirectory();
+		string[] candidates = new string[]
+		{
+		    Path.Combine(baseDir, "spec", "tuya-spec.json"),
+		    Path.Combine(baseDir, "tuya-spec.json"),
+		    Path.Combine(Directory.GetCurrentDirectory(), "spec", "tuya-spec.json"),
+		    Path.Combine(Directory.GetCurrentDirectory(), "tuya-spec.json")
+		};
+
+		string specPath = null;
+		foreach (var c in candidates)
+		{
+		    if (File.Exists(c))
+		    {
+		        specPath = c;
+		        break;
+		    }
+		}
+
+		if (specPath == null)
+		{
+		    string msg = "TuyaConfig: spec/tuya-spec.json not found. Aborting (no fallback allowed). Looked in: " + string.Join("; ", candidates);
+		    FormMain.Singleton.addLog(msg + Environment.NewLine, System.Drawing.Color.Orange);
+		    throw new FileNotFoundException(msg);
+		}
+
+		string raw = File.ReadAllText(specPath, Encoding.UTF8);
+
+		SpecRoot root = null;
+		try
+		{
+		    var jopts = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+		    root = JsonSerializer.Deserialize<SpecRoot>(raw, jopts);
+		}
+		catch (Exception ex)
+		{
+		    string msg = "TuyaConfig: Failed to parse spec/tuya-spec.json with System.Text.Json: " + ex.Message;
+		    FormMain.Singleton.addLog(msg + Environment.NewLine, System.Drawing.Color.Orange);
+		    throw new Exception(msg, ex);
+		}
+
+		if (root == null || root.mappings == null)
+		{
+		    string msg = "TuyaConfig: spec/tuya-spec.json missing mappings.";
+		    FormMain.Singleton.addLog(msg + Environment.NewLine, System.Drawing.Color.Orange);
+		    throw new Exception(msg);
+		}
+
+		// build maps
+		s_keyMap = new Dictionary<string, MappingEntry>(StringComparer.OrdinalIgnoreCase);
+		s_regexList = new List<KeyValuePair<Regex, MappingEntry>>();
+		s_valueMaps = root.valueMaps ?? new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+
+		foreach (var m in root.mappings)
+		{
+		    if (m == null || string.IsNullOrWhiteSpace(m.search)) continue;
+		    string s = m.search.Trim();
+		    if (s.Length >= 2 && s[0] == '/' && s[s.Length - 1] == '/')
+		    {
+		        string body = s.Substring(1, s.Length - 2);
+		        try
+		        {
+		            var rx = new Regex(body, RegexOptions.Compiled | RegexOptions.CultureInvariant);
+		            s_regexList.Add(new KeyValuePair<Regex, MappingEntry>(rx, m));
+		        }
+		        catch (Exception ex)
+		        {
+		            FormMain.Singleton.addLog("TuyaConfig: invalid regex in spec '" + s + "': " + ex.Message + Environment.NewLine, System.Drawing.Color.Orange);
+		            // skip invalid mapping
+		        }
+		    }
+		    else
+		    {
+		        if (!s_keyMap.ContainsKey(s))
+		            s_keyMap[s] = m;
+		        else
+		        {
+		            FormMain.Singleton.addLog("TuyaConfig: duplicate mapping for key '" + s + "' in spec; first kept." + Environment.NewLine, System.Drawing.Color.Orange);
+		        }
+		    }
+		}
+
+		s_mappingsInitialized = true;
+	    }
+	}
         // Helper: map role name -> PinRole (and apply to tg). Return true if applied.
         static bool TryApplyMappingToTemplate(MappingEntry m, string key, string value, OBKConfig tg, int? channelOverride)
         {
