@@ -9,6 +9,11 @@ using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using static BK7231Flasher.MiscUtils;
 
+// These static containers will be filled on demand.
+static Dictionary<string, MappingEntry>? s_keyMap;
+static List<(Regex regex, MappingEntry entry)>? s_regexList;
+static Dictionary<string, Dictionary<string, string>>? s_valueMaps;
+static bool s_mappingsInitialized = false;
 
 // JSON-driven mapping support
 // Add these using directives at file top if not present:
@@ -34,11 +39,6 @@ class SpecRoot
     public Dictionary<string, Dictionary<string, string>>? valueMaps { get; set; }
 }
 
-// These static containers will be filled on demand.
-static Dictionary<string, MappingEntry>? s_keyMap;
-static List<(Regex regex, MappingEntry entry)>? s_regexList;
-static Dictionary<string, Dictionary<string, string>>? s_valueMaps;
-static bool s_mappingsInitialized = false;
 
 // Call this once (lazy) before using mappings.
 static void EnsureMappingsLoaded()
