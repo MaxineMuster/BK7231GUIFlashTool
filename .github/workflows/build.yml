@@ -44,11 +44,11 @@ jobs:
         with:
           name: BK7231GUIFlashTool
           path: |
-            BuildOutput/Release/*.exe
-            BuildOutput/Release/*.dll
-            BuildOutput/Release/easyflash/*.dll
-            BuildOutput/Release/easyflash/*.so
-            BuildOutput/Release/spec/*.json
+            BK7231Flasher/BuildOutput/Release/*.exe
+            BK7231Flasher/BuildOutput/Release/*.dll
+            BK7231Flasher/BuildOutput/Release/easyflash/*.dll
+            BK7231Flasher/BuildOutput/Release/easyflash/*.so
+            BK7231Flasher/BuildOutput/Release/spec/*.json
           if-no-files-found: warn
 
   release:
@@ -61,7 +61,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download Build Artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: BK7231GUIFlashTool
           path: BuildOutput/Release
