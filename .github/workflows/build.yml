@@ -27,8 +27,8 @@ jobs:
 
       - name: Copy spec files
         run: |
-          mkdir -p BuildOutput/Release/spec
-          copy BK7231Flasher/Utils/spec/tuya-spec.json BuildOutput/Release/spec/
+          mkdir -p BK7231Flasher/BuildOutput/Release/spec
+          copy BK7231Flasher/Utils/spec/tuya-spec.json BK7231Flasher/BuildOutput/Release/spec/
 
       - name: Build the project
         run: msbuild BK7231Flasher/BK7231Flasher.csproj /p:Configuration=Release /p:OutDir=BuildOutput\Release\
@@ -48,7 +48,7 @@ jobs:
             BK7231Flasher/BuildOutput/Release/*.dll
             BK7231Flasher/BuildOutput/Release/easyflash/*.dll
             BK7231Flasher/BuildOutput/Release/easyflash/*.so
-            BuildOutput/Release/spec/*.json
+            BK7231Flasher/BuildOutput/Release/spec/*.json
           if-no-files-found: warn
 
   release:
