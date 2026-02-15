@@ -25,13 +25,13 @@ jobs:
       - name: Create Output Directory
         run: mkdir -p BuildOutput/Release
 
-      - name: Build the project
-        run: msbuild BK7231Flasher/BK7231Flasher.csproj /p:Configuration=Release /p:OutDir=BuildOutput\Release\
-
       - name: Copy spec files
         run: |
           mkdir -p BuildOutput/Release/spec
           copy BK7231Flasher/Utils/spec/tuya-spec.json BuildOutput/Release/spec/
+
+      - name: Build the project
+        run: msbuild BK7231Flasher/BK7231Flasher.csproj /p:Configuration=Release /p:OutDir=BuildOutput\Release\
 
       - name: Debug Build Output
         run: |
