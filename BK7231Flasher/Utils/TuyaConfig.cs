@@ -110,7 +110,7 @@ namespace BK7231Flasher
 
         class SpecRoot
         {
-            public JObject meta { get; set; }
+//            public JObject meta { get; set; }
             public List<MappingEntry> mappings { get; set; }
             public Dictionary<string, Dictionary<string, string>> valueMaps { get; set; }
         }
