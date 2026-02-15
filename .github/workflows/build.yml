@@ -48,7 +48,7 @@ jobs:
             BK7231Flasher/BuildOutput/Release/*.dll
             BK7231Flasher/BuildOutput/Release/easyflash/*.dll
             BK7231Flasher/BuildOutput/Release/easyflash/*.so
-            BK7231Flasher/BuildOutput/Release/spec/*.json
+            BuildOutput/Release/spec/*.json
           if-no-files-found: warn
 
   release:
