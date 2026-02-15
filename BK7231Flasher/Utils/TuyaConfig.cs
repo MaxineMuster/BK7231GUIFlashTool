@@ -160,7 +160,16 @@ namespace BK7231Flasher
                 SpecRoot root = null;
                 try
                 {
-                	using System.Text.Json;
+/*
+                    // Use JsonTextReader with CommentHandling.Ignore so C-style comments are allowed
+                    using (var sr = new StringReader(raw))
+                    using (var jr = new JsonTextReader(sr) { CommentHandling = CommentHandling.Ignore })
+                    {
+                        var jo = JObject.Load(jr);
+                        root = jo.ToObject<SpecRoot>();
+                    }
+*/
+//                	using System.Text.Json;
                 	// parse with System.Text.Json 
                 	var jopts = new JsonSerializerOptions { PropertyNameCaseInsensitive = true }; 
                 	SpecRoot root; 
